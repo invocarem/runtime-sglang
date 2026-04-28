@@ -1,0 +1,34 @@
+{
+  "tools": [
+    {
+      "id": "health",
+      "label": "Runtime health",
+      "description": "Check /healthz"
+    },
+    {
+      "id": "models",
+      "label": "List models",
+      "description": "Fetch /v1/models"
+    },
+    {
+      "id": "metrics_snapshot",
+      "label": "Metrics snapshot",
+      "description": "Fetch /v1/metrics"
+    },
+    {
+      "id": "chat_smoke",
+      "label": "Chat smoke test",
+      "description": "Run one completion"
+    },
+    {
+      "id": "benchmark_load",
+      "label": "Load benchmark",
+      "description": "Call /v1/benchmark/load"
+    },
+    {
+      "id": "benchmark_task",
+      "label": "Task benchmark",
+      "description": "Call /v1/benchmark/task"
+    }
+  ]
+}

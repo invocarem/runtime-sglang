@@ -36,6 +36,61 @@
               <span>Args JSON</span>
               <textarea id="tools-args" rows="4" placeholder='{"example":"value"}'></textarea>
             </label>
+            <div id="tools-benchmark-load-fields" class="hidden">
+              <p class="hint">Load benchmark parameters (leave blank to use backend defaults).</p>
+              <div class="row">
+                <label class="field field-grow">
+                  <span>Model</span>
+                  <input type="text" id="tools-bench-model" placeholder="served model id or preset key" />
+                </label>
+                <label class="field">
+                  <span>Base URL</span>
+                  <input type="text" id="tools-bench-base-url" placeholder="http://127.0.0.1:30000" />
+                </label>
+                <label class="field">
+                  <span>Backend</span>
+                  <input type="text" id="tools-bench-backend" placeholder="sglang-oai-chat" />
+                </label>
+              </div>
+              <div class="row">
+                <label class="field">
+                  <span>Dataset</span>
+                  <input type="text" id="tools-bench-dataset" placeholder="random" />
+                </label>
+                <label class="field field-narrow">
+                  <span>Prompts</span>
+                  <input type="number" id="tools-bench-num-prompts" min="1" placeholder="3" />
+                </label>
+                <label class="field field-narrow">
+                  <span>Max concurrency</span>
+                  <input type="number" id="tools-bench-max-concurrency" min="1" placeholder="optional" />
+                </label>
+              </div>
+              <div class="row">
+                <label class="field field-narrow">
+                  <span>Random input len</span>
+                  <input type="number" id="tools-bench-random-input-len" min="1" placeholder="128" />
+                </label>
+                <label class="field field-narrow">
+                  <span>Random output len</span>
+                  <input type="number" id="tools-bench-random-output-len" min="1" placeholder="128" />
+                </label>
+                <label class="field field-grow">
+                  <span>HF model (optional)</span>
+                  <input type="text" id="tools-bench-hf-model" placeholder="Qwen/Qwen3.5-397B-A17B-GPTQ-Int4" />
+                </label>
+              </div>
+              <div class="row">
+                <label class="field field-grow">
+                  <span>Tokenizer (optional)</span>
+                  <input type="text" id="tools-bench-tokenizer" placeholder="HF tokenizer id" />
+                </label>
+              </div>
+              <label class="field field-grow">
+                <span>Extra request body JSON (optional)</span>
+                <textarea id="tools-bench-extra-request-body" rows="3" placeholder='{"chat_template_kwargs":{"enable_thinking":false}}'></textarea>
+              </label>
+            </div>
             <p id="tools-status" class="status" aria-live="polite"></p>
           </section>
           <section class="panel panel-nested">
@@ -107,7 +162,7 @@
             <div id="bench-task-controls" class="row hidden">
               <label class="field field-grow">
                 <span>Input JSONL path</span>
-                <input type="text" id="bench-task-input" value="tools/task_benchmark_seed.jsonl" />
+                <input type="text" id="bench-task-input" value="stack-cli/tools/task_benchmark_seed.jsonl" />
               </label>
               <label class="field field-narrow">
                 <span>Temperature</span>

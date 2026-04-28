@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
 from urllib.parse import urljoin
+import logging
 
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -34,6 +35,21 @@ if str(_REPO_ROOT) not in sys.path:
 from spark_runtime import load_presets, run_benchmark
 
 app = FastAPI(title="SGLang stack UI API")
+
+
+class _SuppressClusterLogAccessFilter(logging.Filter):
+    """Drop chatty cluster-log access lines from uvicorn access logger."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        try:
+            msg = record.getMessage()
+        except Exception:
+            return True
+        return ("/api/cluster-log?" not in msg) and ("/api/cluster-log/stream" not in msg)
+
+
+if os.environ.get("STACK_UI_SUPPRESS_CLUSTER_LOG_ACCESS", "1").strip() == "1":
+    logging.getLogger("uvicorn.access").addFilter(_SuppressClusterLogAccessFilter())
 
 app.add_middleware(
     CORSMiddleware,
@@ -104,6 +120,55 @@ def _resolve_presets_path(presets_file: str) -> Path:
     if not p.is_absolute():
         p = _REPO_ROOT / p
     return p
+
+
+def _resolve_tools_definitions_path(definitions_file: str) -> Path:
+    p = Path(definitions_file)
+    if not p.is_absolute():
+        p = _REPO_ROOT / p
+    return p
+
+
+def _load_tools_definitions(definitions_file: str) -> list[dict[str, Any]]:
+    path = _resolve_tools_definitions_path(definitions_file)
+    if not path.is_file():
+        raise HTTPException(
+            status_code=404,
+            detail=f"Tools definitions file not found: {path}",
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Invalid JSON in tools definitions: {exc}",
+        ) from exc
+    except OSError as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to read tools definitions: {exc}",
+        ) from exc
+
+    tools = payload.get("tools") if isinstance(payload, dict) else None
+    if not isinstance(tools, list):
+        raise HTTPException(status_code=500, detail="tools definitions must contain a 'tools' array.")
+    normalized: list[dict[str, Any]] = []
+    for item in tools:
+        if not isinstance(item, dict):
+            continue
+        tool_id = item.get("id")
+        label = item.get("label")
+        if not isinstance(tool_id, str) or not tool_id.strip():
+            continue
+        if not isinstance(label, str) or not label.strip():
+            continue
+        normalized.append(item)
+    return normalized
+
+
+class ToolRunRequest(BaseModel):
+    tool: str = Field(..., min_length=1)
+    args: dict[str, Any] = Field(default_factory=dict)
 
 
 def _preset_public_summary(cfg: dict[str, object]) -> dict[str, Any]:
@@ -674,6 +739,161 @@ def _read_file_tail(path: Path, max_bytes: int) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _tool_script_path(script_name: str) -> Path:
+    return _REPO_ROOT / "stack-cli" / "tools" / script_name
+
+
+def _to_cli_flag(name: str) -> str:
+    return "--" + name.strip().replace("_", "-")
+
+
+def _tool_arg_value(args: dict[str, Any], name: str) -> Any:
+    normalized = name.strip().lstrip("-")
+    underscored = normalized.replace("-", "_")
+    dashed = normalized.replace("_", "-")
+    for key in (
+        normalized,
+        underscored,
+        dashed,
+        _to_cli_flag(normalized),
+        _to_cli_flag(underscored),
+        _to_cli_flag(dashed),
+    ):
+        if key in args and args[key] is not None:
+            return args[key]
+    return None
+
+
+_HF_ID_PART_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*$")
+
+
+def _infer_hf_repo_from_candidate(candidate: str) -> str:
+    raw = (candidate or "").strip()
+    if not raw:
+        return ""
+    base = os.path.basename(raw.rstrip("/")) or raw
+    if "/" in base or "_" not in base:
+        return ""
+    org, repo = base.split("_", 1)
+    if not org or not repo:
+        return ""
+    if not _HF_ID_PART_RE.fullmatch(org):
+        return ""
+    if not _HF_ID_PART_RE.fullmatch(repo):
+        return ""
+    return f"{org}/{repo}"
+
+
+def _derive_benchmark_hf_model(args: dict[str, Any]) -> str:
+    # Respect explicit user-provided tokenizer/hf_model first.
+    if _tool_arg_value(args, "hf_model") or _tool_arg_value(args, "tokenizer"):
+        return ""
+
+    model_value = _tool_arg_value(args, "model")
+    model = model_value.strip() if isinstance(model_value, str) else ""
+    if not model:
+        return ""
+    if "/" in model:
+        return model
+
+    # Try direct conversion from model id/path basename, e.g. Qwen_Qwen3.6-27B -> Qwen/Qwen3.6-27B.
+    guessed = _infer_hf_repo_from_candidate(model)
+    if guessed:
+        return guessed
+
+    # If model is a preset key, attempt conversion from preset model_path basename.
+    try:
+        presets = load_presets(str(_resolve_presets_path("model_presets.json")))
+    except Exception:
+        presets = {}
+    cfg = presets.get(model) if isinstance(presets, dict) else None
+    if isinstance(cfg, dict):
+        model_path = cfg.get("model_path")
+        if isinstance(model_path, str):
+            return _infer_hf_repo_from_candidate(model_path)
+    return ""
+
+
+def _run_tool_script(script_name: str, cli_args: list[str], timeout_sec: int = 900) -> dict[str, Any]:
+    script_path = _tool_script_path(script_name)
+    if not script_path.is_file():
+        raise HTTPException(status_code=404, detail=f"Tool script not found: {script_path}")
+
+    py_exec = _tool_python_executable(script_name)
+    cmd = [py_exec, str(script_path), *cli_args]
+    env = _tool_script_env(script_name)
+    try:
+        proc = subprocess.run(
+            cmd,
+            cwd=str(_REPO_ROOT),
+            capture_output=True,
+            text=True,
+            timeout=max(1, timeout_sec),
+            env=env,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(status_code=504, detail=f"Tool timed out after {timeout_sec}s: {script_name}") from exc
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Failed to run tool script: {exc}") from exc
+
+    stdout = (proc.stdout or "").strip()
+    stderr = (proc.stderr or "").strip()
+    parsed_output: Any = stdout
+    if stdout:
+        try:
+            parsed_output = json.loads(stdout)
+        except json.JSONDecodeError:
+            parsed_output = stdout
+
+    if proc.returncode != 0:
+        error_msg = f"{script_name} exited with code {proc.returncode}"
+        if stderr:
+            error_msg = f"{error_msg}: {stderr}"
+        return {
+            "ok": False,
+            "error": error_msg,
+            "output": {
+                "exit_code": proc.returncode,
+                "stdout": parsed_output,
+                "stderr": stderr,
+                "command": cmd,
+            },
+        }
+
+    output: dict[str, Any] = {"result": parsed_output}
+    if stderr:
+        output["stderr"] = stderr
+    return {"ok": True, "output": output}
+
+
+def _tool_python_executable(script_name: str) -> str:
+    if script_name not in {"benchmark_sglang.py", "task_benchmark.py"}:
+        return sys.executable
+    for env_key in ("STACK_UI_BENCHMARK_PYTHON", "BENCHMARK_PYTHON"):
+        raw = os.environ.get(env_key, "").strip()
+        if not raw:
+            continue
+        expanded = os.path.expanduser(raw)
+        if os.path.isfile(expanded) and os.access(expanded, os.X_OK):
+            return expanded
+    default_bench = os.path.expanduser("~/.sglang/bin/python")
+    if os.path.isfile(default_bench) and os.access(default_bench, os.X_OK):
+        return default_bench
+    return sys.executable
+
+
+def _tool_script_env(script_name: str) -> dict[str, str]:
+    env = os.environ.copy()
+    if script_name not in {"benchmark_sglang.py", "task_benchmark.py"}:
+        return env
+    local_sglang_python = str(_REPO_ROOT / "sglang" / "python")
+    old_pythonpath = env.get("PYTHONPATH", "").strip()
+    env["PYTHONPATH"] = (
+        f"{local_sglang_python}:{old_pythonpath}" if old_pythonpath else local_sglang_python
+    )
+    return env
+
+
 def _shell_quote_path_allow_home(path: str) -> str:
     if path == "~":
         return "$HOME"
@@ -921,6 +1141,112 @@ def api_presets(
     }
 
 
+@app.get("/api/tools/definitions")
+def api_tools_definitions(
+    definitions_file: str = Query(
+        "definitions.json",
+        description="Path to JSON tool definitions (relative to repo root unless absolute)",
+    ),
+) -> dict[str, Any]:
+    tools = _load_tools_definitions(definitions_file)
+    return {"tools": tools}
+
+
+@app.post("/api/tools/run")
+def api_tools_run(req: ToolRunRequest) -> dict[str, Any]:
+    tool = req.tool.strip()
+    args = req.args
+
+    try:
+        if tool == "health":
+            body = healthz()
+            return {"ok": True, "output": {"status": 200, "body": body}}
+
+        if tool == "models":
+            output = runtime_models()
+            return {"ok": True, "output": output}
+
+        if tool == "metrics_snapshot":
+            output = runtime_metrics()
+            lines = output.get("highlightLines")
+            if isinstance(lines, list):
+                output = {**output, "highlightLines": lines[:30]}
+            return {"ok": True, "output": output}
+
+        if tool == "chat_smoke":
+            model = str(args.get("model", ""))
+            prompt = str(args.get("prompt", "hello"))
+            try:
+                temperature = float(args.get("temperature", 0.2))
+            except (TypeError, ValueError):
+                temperature = 0.2
+            try:
+                max_tokens = int(args.get("max_tokens", 64))
+            except (TypeError, ValueError):
+                max_tokens = 64
+
+            payload = {
+                "model": model,
+                "messages": [{"role": "user", "content": prompt}],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+            }
+            output = runtime_chat_completions(payload)
+            return {"ok": True, "output": output}
+
+        if tool == "benchmark_load":
+            cli_args: list[str] = []
+            raw_argv = args.get("argv")
+            if isinstance(raw_argv, list) and all(isinstance(x, str) for x in raw_argv):
+                cli_args.extend(raw_argv)
+            else:
+                for key in (
+                    "base_url",
+                    "backend",
+                    "dataset_name",
+                    "num_prompts",
+                    "random_input_len",
+                    "random_output_len",
+                    "max_concurrency",
+                    "model",
+                    "hf_model",
+                    "tokenizer",
+                ):
+                    value = _tool_arg_value(args, key)
+                    if value is None:
+                        continue
+                    cli_args.extend([_to_cli_flag(key), str(value)])
+                extra_request_body = _tool_arg_value(args, "extra_request_body")
+                if isinstance(extra_request_body, dict):
+                    cli_args.extend(["--extra-request-body", json.dumps(extra_request_body)])
+                elif isinstance(extra_request_body, str) and extra_request_body.strip():
+                    cli_args.extend(["--extra-request-body", extra_request_body.strip()])
+                derived_hf = _derive_benchmark_hf_model(args)
+                if derived_hf:
+                    cli_args.extend(["--hf-model", derived_hf])
+            return _run_tool_script("benchmark_sglang.py", cli_args)
+
+        if tool == "benchmark_task":
+            cli_args = []
+            raw_argv = args.get("argv")
+            if isinstance(raw_argv, list) and all(isinstance(x, str) for x in raw_argv):
+                cli_args.extend(raw_argv)
+            else:
+                for key in ("input", "base_url", "model", "temperature", "max_tokens", "timeout"):
+                    value = _tool_arg_value(args, key)
+                    if value is None:
+                        continue
+                    cli_args.extend([_to_cli_flag(key), str(value)])
+            return _run_tool_script("task_benchmark.py", cli_args)
+
+        return {"ok": False, "error": f"Unknown tool '{tool}'."}
+    except HTTPException as exc:
+        detail = exc.detail if isinstance(exc.detail, str) else json.dumps(exc.detail, default=str)
+        return {"ok": False, "error": f"HTTP {exc.status_code}: {detail}", "output": exc.detail}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc)}
+
+
 @app.post("/api/launch")
 def api_launch(req: LaunchRequest) -> dict[str, Any]:
     if not _launch_allowed():
@@ -946,9 +1272,9 @@ def api_launch(req: LaunchRequest) -> dict[str, Any]:
             detail=f"Unknown preset '{req.preset}'. Available: {', '.join(sorted(presets))}",
         )
 
-    spark_py = _REPO_ROOT / "spark_runtime.py"
+    spark_py = _REPO_ROOT / "stack-cli" / "runtime" / "spark_runtime.py"
     if not spark_py.is_file():
-        raise HTTPException(status_code=500, detail=f"Missing spark_runtime.py at {spark_py}")
+        raise HTTPException(status_code=500, detail=f"Missing runtime script at {spark_py}")
 
     cmd: list[str] = [
         sys.executable,

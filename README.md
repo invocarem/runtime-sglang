@@ -48,15 +48,15 @@ so far I did not do anything for audio.
 
 ## 5. Python ops CLI for two DGX Spark nodes
 
-Use `spark_runtime.py` from this folder for deploy, launch, benchmark, and measurement.
+Use `stack-cli/runtime/spark_runtime.py` for deploy, launch, benchmark, and measurement.
 
 ### Use `.env` (recommended simple flow)
 ```bash
 cp .env.example .env
 
-python spark_runtime.py deploy --env-file .env
-python spark_runtime.py launch --mode cluster --env-file .env
-python spark_runtime.py measure --env-file .env
+python stack-cli/runtime/spark_runtime.py deploy --env-file .env
+python stack-cli/runtime/spark_runtime.py launch --mode cluster --env-file .env
+python stack-cli/runtime/spark_runtime.py measure --env-file .env
 ```
 
 `.env` keys supported:
@@ -69,7 +69,7 @@ python spark_runtime.py measure --env-file .env
 
 ### Deploy to another Spark
 ```bash
-python spark_runtime.py deploy \
+python stack-cli/runtime/spark_runtime.py deploy \
   --hosts spark-02 \
   --remote-dir ~/runtime-sglang
 ```
@@ -77,10 +77,10 @@ python spark_runtime.py deploy \
 ### Launch server (solo)
 ```bash
 # Local node
-python spark_runtime.py launch --mode solo --model-path ~/huggingface/Qwen_Qwen3.5-2B
+python stack-cli/runtime/spark_runtime.py launch --mode solo --model-path ~/huggingface/Qwen_Qwen3.5-2B
 
 # Remote node
-python spark_runtime.py launch --mode solo --host spark-02 --model-path ~/huggingface/Qwen_Qwen3.5-2B
+python stack-cli/runtime/spark_runtime.py launch --mode solo --host spark-02 --model-path ~/huggingface/Qwen_Qwen3.5-2B
 ```
 
 ### Launch with model presets
@@ -89,22 +89,22 @@ python spark_runtime.py launch --mode solo --host spark-02 --model-path ~/huggin
 cp model_presets.json.example model_presets.json
 
 # Inspect available presets
-python spark_runtime.py launch --list-presets
+python stack-cli/runtime/spark_runtime.py launch --list-presets
 
 # Launch with a preset
-python spark_runtime.py launch --mode solo --preset qwen3.5-2b
+python stack-cli/runtime/spark_runtime.py launch --mode solo --preset qwen3.5-2b
 
 # Override preset values when needed
-python spark_runtime.py launch --mode solo --preset qwen3.5-397b --tp 16 --port 31000
+python stack-cli/runtime/spark_runtime.py launch --mode solo --preset qwen3.5-397b --tp 16 --port 31000
 
 # Add extra launch flags on top of preset/.env
-python spark_runtime.py launch --mode solo --preset qwen3.5-2b \
+python stack-cli/runtime/spark_runtime.py launch --mode solo --preset qwen3.5-2b \
   --sglang-args "--context-length 65536 --mem-fraction-static 0.8 --enable-metrics --trust-remote-code"
 ```
 
 ### Launch cluster (2 nodes)
 ```bash
-python spark_runtime.py launch \
+python stack-cli/runtime/spark_runtime.py launch \
   --mode cluster \
   --hosts spark-01 spark-02 \
   --dist-addr spark-01:20000 \
@@ -113,7 +113,7 @@ python spark_runtime.py launch \
 
 ### Benchmark runtime
 ```bash
-python spark_runtime.py benchmark \
+python stack-cli/runtime/spark_runtime.py benchmark \
   --base-url http://spark-01:30000 \
   --model default \
   --requests 50
@@ -122,10 +122,10 @@ python spark_runtime.py benchmark \
 ### Measure utilization
 ```bash
 # local snapshot
-python spark_runtime.py measure
+python stack-cli/runtime/spark_runtime.py measure
 
 # both nodes
-python spark_runtime.py measure --hosts spark-01 spark-02
+python stack-cli/runtime/spark_runtime.py measure --hosts spark-01 spark-02
 ```
 
 Notes:
