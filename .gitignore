@@ -2,7 +2,10 @@ sglang/
 pytorch/
 vision/
 .env
+
 model_presets.json
+deploy_sets.json
+
 *.log
 node_modules/
 .venv/
