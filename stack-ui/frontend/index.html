@@ -1,12 +1,232 @@
 <!doctype html>
 <html lang="en">
-  <head>
-    <meta charset="UTF-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>SGLang stack UI</title>
-  </head>
-  <body>
-    <div id="root"></div>
-    <script type="module" src="/src/main.tsx"></script>
-  </body>
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>SGLang Runtime UI Core</title>
+  <link rel="stylesheet" href="/src/styles.css" />
+</head>
+<body>
+  <div class="layout">
+    <header class="header">
+      <h1>SGLang Runtime UI</h1>
+      <p class="hint">UI core wired for <code>backend/runtime-api-template</code> endpoints.</p>
+    </header>
+
+    <div class="shell">
+      <div class="shell-main">
+        <nav class="tabs" role="tablist" aria-label="Main tools">
+          <button type="button" role="tab" id="tab-starter" aria-selected="true" aria-controls="panel-starter">Starter</button>
+          <button type="button" role="tab" id="tab-logs" aria-selected="false" aria-controls="panel-logs">Logs</button>
+          <button type="button" role="tab" id="tab-tools" aria-selected="true" aria-controls="panel-tools">Tools</button>
+          <button type="button" role="tab" id="tab-metrics" aria-selected="false" aria-controls="panel-metrics">Metrics</button>
+          <button type="button" role="tab" id="tab-benchmark" aria-selected="false" aria-controls="panel-benchmark">Benchmark</button>
+        </nav>
+
+        <div id="panel-starter" role="tabpanel" aria-labelledby="tab-starter" class="tab-panel">
+          <section class="panel panel-nested">
+            <h2>Starter</h2>
+            <p class="hint">Quick runtime checks for <code>runtime-api-template</code>.</p>
+            <div class="row">
+              <button type="button" id="starter-refresh" class="btn primary">Refresh status</button>
+              <button type="button" id="starter-stop" class="btn">Stop server</button>
+            </div>
+            <p id="starter-status" class="status" aria-live="polite"></p>
+          </section>
+          <section class="panel panel-nested">
+            <h2>Launch with spark_runtime</h2>
+            <p class="hint">Uses <code>/api/presets</code> and <code>/api/launch</code> on the stack-ui backend.</p>
+            <div class="row">
+              <label class="field field-grow">
+                <span>Preset</span>
+                <select id="starter-preset"></select>
+              </label>
+              <label class="field">
+                <span>Mode</span>
+                <select id="starter-launch-mode">
+                  <option value="solo">solo</option>
+                  <option value="cluster">cluster</option>
+                </select>
+              </label>
+            </div>
+            <label class="field field-grow" id="starter-solo-host-field">
+              <span>SSH host (solo, optional)</span>
+              <input type="text" id="starter-solo-host" placeholder="empty = local launch" />
+            </label>
+            <label class="field field-grow hidden" id="starter-cluster-hosts-field">
+              <span>Hosts (cluster, comma-separated)</span>
+              <input type="text" id="starter-cluster-hosts" placeholder="spark-01, spark-02" />
+            </label>
+            <div class="row">
+              <button type="button" id="starter-launch" class="btn primary">Launch</button>
+            </div>
+            <p id="starter-launch-status" class="status" aria-live="polite"></p>
+            <pre id="starter-launch-output" class="out out-short">Launch output will appear here.</pre>
+          </section>
+          <section class="panel panel-nested">
+            <h2>Available models</h2>
+            <pre id="starter-models" class="out out-short">Press "Refresh status" to query /v1/models.</pre>
+          </section>
+        </div>
+
+        <div id="panel-logs" role="tabpanel" aria-labelledby="tab-logs" class="tab-panel hidden" hidden>
+          <section class="panel panel-nested">
+            <h2>Launch logs</h2>
+            <p class="hint">Local launch log or remote cluster node log (spark1/spark2) with SSE and polling fallback.</p>
+            <div class="row">
+              <label class="field">
+                <span>Source</span>
+                <select id="logs-source">
+                  <option value="local" selected>Local launch.log</option>
+                  <option value="cluster">Cluster node log</option>
+                </select>
+              </label>
+              <label class="field hidden" id="logs-host-field">
+                <span>Host</span>
+                <input type="text" id="logs-host" value="spark1" />
+              </label>
+              <label class="field hidden" id="logs-node-field">
+                <span>Node rank</span>
+                <input type="number" id="logs-node-rank" min="0" value="0" />
+              </label>
+            </div>
+            <div class="row">
+              <button type="button" id="logs-connect" class="btn primary">Connect</button>
+              <button type="button" id="logs-disconnect" class="btn">Disconnect</button>
+              <button type="button" id="logs-clear" class="btn">Clear</button>
+            </div>
+            <p id="logs-status" class="status" aria-live="polite"></p>
+            <pre id="logs-output" class="out">No logs yet.</pre>
+          </section>
+        </div>
+
+        <div id="panel-tools" role="tabpanel" aria-labelledby="tab-tools" class="tab-panel hidden" hidden>
+          <section class="panel panel-nested">
+            <h2>Tools</h2>
+            <p class="hint">Optional backend-defined runner (`/api/tools/*`).</p>
+            <div class="row">
+              <label class="field field-grow">
+                <span>Tool</span>
+                <select id="tools-select"></select>
+              </label>
+              <button type="button" id="tools-run" class="btn primary">Run tool</button>
+            </div>
+            <label class="field field-grow">
+              <span>Args JSON</span>
+              <textarea id="tools-args" rows="4" placeholder='{"example":"value"}'></textarea>
+            </label>
+            <p id="tools-status" class="status" aria-live="polite"></p>
+          </section>
+          <section class="panel panel-nested">
+            <h2>Output</h2>
+            <pre id="tools-output" class="out out-short">No output yet.</pre>
+          </section>
+        </div>
+
+        <div id="panel-metrics" role="tabpanel" aria-labelledby="tab-metrics" class="tab-panel hidden" hidden>
+          <section class="panel panel-nested">
+            <p id="metrics-config" class="config-line"></p>
+            <div class="row">
+              <button type="button" id="btn-metrics-refresh" class="btn primary">Refresh metrics</button>
+              <label class="field">
+                <span>Auto-refresh</span>
+                <select id="sel-metrics-interval">
+                  <option value="0">Off</option>
+                  <option value="3000">Every 3 s</option>
+                  <option value="10000" selected>Every 10 s</option>
+                  <option value="30000">Every 30 s</option>
+                </select>
+              </label>
+            </div>
+            <p id="status-metrics" class="status" aria-live="polite"></p>
+            <pre id="metrics-highlights" class="out out-short">Open this tab to load metrics.</pre>
+            <label class="checkbox-row">
+              <input type="checkbox" id="chk-metrics-raw" />
+              <span>Show raw text</span>
+            </label>
+            <pre id="metrics-raw" class="out hidden">-</pre>
+          </section>
+        </div>
+
+        <div id="panel-benchmark" role="tabpanel" aria-labelledby="tab-benchmark" class="tab-panel hidden" hidden>
+          <section class="panel panel-nested">
+            <div class="row">
+              <label class="field">
+                <span>Mode</span>
+                <select id="bench-mode">
+                  <option value="load" selected>Load benchmark</option>
+                  <option value="task">Task benchmark</option>
+                </select>
+              </label>
+            </div>
+            <div class="row">
+              <label class="field field-grow">
+                <span>Model</span>
+                <input type="text" id="bench-model" placeholder="Served model id" />
+              </label>
+            </div>
+            <label class="field field-grow" id="bench-load-message-field">
+              <span>Prompt</span>
+              <textarea id="bench-message" rows="3" placeholder="Prompt for load test"></textarea>
+            </label>
+            <div class="row" id="bench-load-controls">
+              <label class="field field-narrow">
+                <span>Concurrency</span>
+                <input type="number" id="bench-concurrency" min="1" value="4" />
+              </label>
+              <label class="field field-narrow">
+                <span>Total requests</span>
+                <input type="number" id="bench-requests" min="1" value="20" />
+              </label>
+              <label class="field field-narrow">
+                <span>max_tokens</span>
+                <input type="number" id="bench-max-tokens" min="1" value="256" />
+              </label>
+            </div>
+            <label class="field field-grow hidden" id="bench-task-json-field">
+              <span>Tasks JSON array</span>
+              <textarea id="bench-task-json" rows="6" placeholder='[{"id":"t1","category":"demo","prompt":"What is 6*7?","checker":{"type":"contains","value":"42"}}]'></textarea>
+            </label>
+            <div id="bench-task-controls" class="row hidden">
+              <label class="field field-narrow">
+                <span>Temperature</span>
+                <input type="number" id="bench-task-temperature" step="0.1" value="0.2" />
+              </label>
+              <label class="field field-narrow">
+                <span>max_tokens</span>
+                <input type="number" id="bench-task-max-tokens" min="1" value="1024" />
+              </label>
+            </div>
+            <button type="button" id="bench-run" class="btn primary">Run benchmark</button>
+            <p id="bench-status" class="status"></p>
+          </section>
+          <section class="panel panel-nested">
+            <h2>Results</h2>
+            <pre id="bench-results" class="out out-short">No runs yet.</pre>
+          </section>
+        </div>
+      </div>
+
+      <aside class="chat-aside" aria-label="Chat playground">
+        <h2 class="chat-aside__title">Chat</h2>
+        <p class="hint chat-aside__hint">Uses <code>POST /v1/chat/completions</code>.</p>
+        <label class="field field-chat-model">
+          <span>Model</span>
+          <input type="text" id="chat-model" placeholder="Served model id" />
+        </label>
+        <div id="chat-messages" class="chat-messages" role="log" aria-live="polite"></div>
+        <label class="field field-chat-input">
+          <span>Message</span>
+          <textarea id="chat-input" rows="3" placeholder="Enter to send, Shift+Enter newline"></textarea>
+        </label>
+        <div class="row chat-actions">
+          <button type="button" id="chat-send" class="btn primary">Send</button>
+          <button type="button" id="chat-clear" class="btn">Clear</button>
+        </div>
+        <p id="chat-status" class="status chat-status"></p>
+      </aside>
+    </div>
+  </div>
+  <script type="module" src="/src/main.tsx"></script>
+</body>
 </html>

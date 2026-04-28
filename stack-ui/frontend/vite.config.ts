@@ -24,6 +24,12 @@ export default defineConfig({
         timeout: 3_600_000,
         proxyTimeout: 3_600_000,
       },
+      "/v1": {
+        target: apiTarget,
+        changeOrigin: true,
+        timeout: 3_600_000,
+        proxyTimeout: 3_600_000,
+      },
       "/health": {
         target: apiTarget,
         changeOrigin: true,

@@ -1,11 +1,4 @@
-/** Prefix for calling runtime API (empty = same origin / Vite proxy). */
-export function apiUrl(path: string): string {
-  const base = import.meta.env.VITE_API_URL?.replace(/\/$/, "") ?? "";
-  return `${base}${path}`;
-}
-
-export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T> {
-  const url = apiUrl(path);
+export async function fetchJson<T>(url: string, init?: RequestInit): Promise<T> {
   const res = await fetch(url, init);
   const text = await res.text();
   let body: unknown = null;
@@ -24,23 +17,16 @@ export async function fetchJson<T>(path: string, init?: RequestInit): Promise<T>
   return body as T;
 }
 
-type ModelsResponse = {
-  data?: Array<{ id?: string }>;
-};
-
 export type UiConfig = {
   inferenceBaseUrl?: string;
   metricsUrl?: string;
   defaultModel?: string;
+  error?: string;
 };
 
 export async function loadUiConfig(): Promise<UiConfig> {
   try {
-    const models = await fetchJson<ModelsResponse>("/v1/models");
-    const defaultModel = Array.isArray(models.data)
-      ? (models.data.find((m) => typeof m?.id === "string" && m.id.trim())?.id ?? "")
-      : "";
-    return { defaultModel };
+    return await fetchJson<UiConfig>("/api/config");
   } catch {
     return {};
   }

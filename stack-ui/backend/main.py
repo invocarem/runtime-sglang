@@ -6,15 +6,20 @@ import asyncio
 import json
 import os
 import re
+import shlex
 import signal
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlparse
+from urllib.parse import urljoin
 
 from fastapi import Body, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
@@ -41,6 +46,57 @@ app.add_middleware(
 
 def _launch_allowed() -> bool:
     return os.environ.get("STACK_UI_ALLOW_LAUNCH", "").strip() == "1"
+
+
+_RUNTIME_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"}
+
+
+def _runtime_request_timeout_sec() -> int:
+    raw = os.environ.get("SGLANG_REQUEST_TIMEOUT_MS", "120000").strip()
+    try:
+        ms = int(raw)
+    except ValueError:
+        ms = 120000
+    ms = max(ms, 1000)
+    return int(ms / 1000)
+
+
+def _models_timeout_sec() -> int:
+    raw = os.environ.get("SGLANG_MODELS_TIMEOUT_MS", "5000").strip()
+    try:
+        ms = int(raw)
+    except ValueError:
+        ms = 5000
+    ms = max(ms, 1000)
+    return int(ms / 1000)
+
+
+def _assert_runtime_url_safe(url_string: str) -> str:
+    parsed = urlparse(url_string)
+    if parsed.scheme not in {"http", "https"}:
+        raise HTTPException(status_code=500, detail="Only http(s) URLs are allowed for SGLang upstream.")
+    host = (parsed.hostname or "").lower()
+    if os.environ.get("SGLANG_ALLOW_ANY_HOST", "").strip() == "1":
+        return url_string
+    if host not in _RUNTIME_ALLOWED_HOSTS:
+        raise HTTPException(
+            status_code=500,
+            detail="SGLang host must be localhost/127.0.0.1/::1 (or set SGLANG_ALLOW_ANY_HOST=1).",
+        )
+    return url_string
+
+
+def _runtime_base_url() -> str:
+    base = os.environ.get("SGLANG_BASE_URL", "http://127.0.0.1:30000").strip() or "http://127.0.0.1:30000"
+    return _assert_runtime_url_safe(base).rstrip("/")
+
+
+def _runtime_metrics_url() -> str:
+    full = os.environ.get("SGLANG_METRICS_URL", "").strip()
+    if full:
+        return _assert_runtime_url_safe(full)
+    metrics_path = os.environ.get("SGLANG_METRICS_PATH", "/metrics")
+    return urljoin(_runtime_base_url() + "/", metrics_path.lstrip("/"))
 
 
 def _resolve_presets_path(presets_file: str) -> Path:
@@ -151,6 +207,68 @@ def fetch_openai_models(base_url: str, api_key: str, timeout_sec: int) -> dict[s
     }
 
 
+def _runtime_json_request(method: str, url: str, timeout_sec: int, body: Any | None = None) -> tuple[int, Any]:
+    data = None
+    headers = {"Accept": "application/json"}
+    if body is not None:
+        headers["Content-Type"] = "application/json"
+        data = json.dumps(body).encode("utf-8")
+    req = urllib.request.Request(url=url, headers=headers, method=method.upper(), data=data)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+            status = int(getattr(response, "status", 200))
+            raw = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        raise HTTPException(status_code=exc.code, detail=f"Upstream HTTP {exc.code}: {body_text[:1000]}") from exc
+    except urllib.error.URLError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach inference server: {exc}") from exc
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Upstream request timed out.") from exc
+
+    try:
+        parsed = json.loads(raw) if raw else {}
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail=f"Invalid JSON from upstream: {exc}") from exc
+    return status, parsed
+
+
+def _runtime_text_request(url: str, timeout_sec: int) -> tuple[int, str]:
+    req = urllib.request.Request(url=url, method="GET")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout_sec) as response:
+            status = int(getattr(response, "status", 200))
+            raw = response.read().decode("utf-8", errors="replace")
+    except urllib.error.HTTPError as exc:
+        body_text = exc.read().decode("utf-8", errors="replace") if exc.fp else ""
+        raise HTTPException(status_code=exc.code, detail=f"Upstream HTTP {exc.code}: {body_text[:1000]}") from exc
+    except urllib.error.URLError as exc:
+        raise HTTPException(status_code=502, detail=f"Could not reach inference server: {exc}") from exc
+    except TimeoutError as exc:
+        raise HTTPException(status_code=504, detail="Upstream request timed out.") from exc
+    return status, raw
+
+
+def _assistant_from_completion_body(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+    choices = payload.get("choices")
+    if not isinstance(choices, list) or not choices:
+        return None
+    first = choices[0]
+    if not isinstance(first, dict):
+        return None
+    message = first.get("message")
+    if isinstance(message, dict):
+        content = message.get("content")
+        if isinstance(content, str):
+            return content
+    text = first.get("text")
+    if isinstance(text, str):
+        return text
+    return None
+
+
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
@@ -159,6 +277,277 @@ def health() -> dict[str, str]:
 @app.head("/health")
 def health_head() -> Response:
     return Response(status_code=200)
+
+
+@app.get("/healthz")
+def healthz() -> dict[str, str]:
+    _, models = _runtime_json_request("GET", _runtime_base_url() + "/v1/models", _models_timeout_sec())
+    if not isinstance(models, dict):
+        raise HTTPException(status_code=502, detail="Invalid /v1/models response.")
+    return {"status": "ok"}
+
+
+@app.get("/v1/models")
+def runtime_models() -> Any:
+    _, payload = _runtime_json_request("GET", _runtime_base_url() + "/v1/models", _models_timeout_sec())
+    return payload
+
+
+@app.get("/v1/metrics")
+def runtime_metrics() -> dict[str, Any]:
+    _status, text = _runtime_text_request(_runtime_metrics_url(), _runtime_request_timeout_sec())
+    max_chars = int(os.environ.get("RUNTIME_METRICS_MAX_CHARS", "256000"))
+    max_lines = int(os.environ.get("RUNTIME_METRICS_HIGHLIGHT_LINES", "500"))
+    lines = [line for line in text.splitlines() if "sglang" in line.lower()][:max_lines]
+    return {
+        "url": _runtime_metrics_url(),
+        "fetchedAt": datetime.now(timezone.utc).isoformat(),
+        "highlightLines": lines,
+        "rawPreview": text[:max_chars],
+        "rawTruncated": len(text) > max_chars,
+    }
+
+
+@app.post("/v1/chat/completions")
+def runtime_chat_completions(body: Any = Body(...)) -> Any:
+    status, payload = _runtime_json_request(
+        "POST",
+        _runtime_base_url() + "/v1/chat/completions",
+        _runtime_request_timeout_sec(),
+        body=body,
+    )
+    if status >= 400:
+        raise HTTPException(status_code=status, detail=payload)
+    return payload
+
+
+@app.post("/v1/benchmark/load")
+def runtime_load_benchmark(body: Any = Body(...)) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected JSON object body.")
+    model = body.get("model")
+    message = body.get("message")
+    requests = body.get("requests")
+    concurrency = body.get("concurrency")
+    max_tokens = body.get("max_tokens")
+    if not isinstance(model, str) or not model.strip():
+        raise HTTPException(status_code=400, detail="model must be a non-empty string.")
+    if not isinstance(message, str) or not message.strip():
+        raise HTTPException(status_code=400, detail="message must be a non-empty string.")
+    if not isinstance(requests, int) or requests < 1:
+        raise HTTPException(status_code=400, detail="requests must be an integer >= 1.")
+    if not isinstance(concurrency, int) or concurrency < 1:
+        raise HTTPException(status_code=400, detail="concurrency must be an integer >= 1.")
+    if max_tokens is not None and (not isinstance(max_tokens, int) or max_tokens < 1):
+        raise HTTPException(status_code=400, detail="max_tokens must be a positive integer.")
+
+    max_requests = int(os.environ.get("RUNTIME_BENCHMARK_MAX_REQUESTS", "300"))
+    max_concurrency = int(os.environ.get("RUNTIME_BENCHMARK_MAX_CONCURRENCY", "64"))
+    if requests > max_requests:
+        raise HTTPException(status_code=400, detail=f"requests must be <= {max_requests}.")
+    if concurrency > max_concurrency:
+        raise HTTPException(status_code=400, detail=f"concurrency must be <= {max_concurrency}.")
+
+    latencies_ms: list[int] = []
+    errors: list[str] = []
+    success = 0
+    fail = 0
+    sample_content: str | None = None
+
+    def one_request(index: int) -> tuple[int, int, str | None, str | None]:
+        started = time.perf_counter()
+        try:
+            _, payload = _runtime_json_request(
+                "POST",
+                _runtime_base_url() + "/v1/chat/completions",
+                _runtime_request_timeout_sec(),
+                body={
+                    "model": model,
+                    "messages": [{"role": "user", "content": message}],
+                    "max_tokens": max_tokens,
+                    "separate_reasoning": False,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+            )
+            latency = int((time.perf_counter() - started) * 1000)
+            content = _assistant_from_completion_body(payload)
+            if content is None:
+                return index, latency, None, "Upstream completion response did not contain assistant text."
+            return index, latency, content, None
+        except HTTPException as exc:
+            latency = int((time.perf_counter() - started) * 1000)
+            return index, latency, None, str(exc.detail)
+
+    started = time.perf_counter()
+    workers = min(requests, concurrency)
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        futures = [pool.submit(one_request, i) for i in range(requests)]
+        for fut in as_completed(futures):
+            idx, latency, content, err = fut.result()
+            latencies_ms.append(latency)
+            if content is not None:
+                success += 1
+                if idx == 0:
+                    sample_content = content
+            else:
+                fail += 1
+                if err and len(errors) < 8:
+                    errors.append(err)
+
+    wall_ms = int((time.perf_counter() - started) * 1000)
+    sorted_latencies = sorted(latencies_ms)
+
+    def percentile(p: int) -> int:
+        if not sorted_latencies:
+            return 0
+        idx = max(0, min(len(sorted_latencies) - 1, int((p / 100) * len(sorted_latencies)) - 1))
+        return sorted_latencies[idx]
+
+    throughput_rps = (success / (wall_ms / 1000)) if wall_ms > 0 else 0.0
+    return {
+        "model": model,
+        "requests": requests,
+        "concurrency": min(requests, concurrency),
+        "successes": success,
+        "failures": fail,
+        "wallTimeMs": wall_ms,
+        "p50": percentile(50),
+        "p95": percentile(95),
+        "p99": percentile(99),
+        "throughputRps": throughput_rps,
+        "errorSamples": errors,
+        "sampleContent": sample_content,
+    }
+
+
+def _run_task_checker(text: str, checker: dict[str, Any]) -> tuple[bool, str]:
+    checker_type = checker.get("type")
+    if checker_type == "regex":
+        pattern = checker.get("pattern")
+        flags_text = checker.get("flags", "")
+        if not isinstance(pattern, str):
+            return False, "regex checker requires string pattern"
+        flags = 0
+        if isinstance(flags_text, str) and "i" in flags_text:
+            flags |= re.IGNORECASE
+        try:
+            matched = re.search(pattern, text, flags=flags) is not None
+        except re.error as exc:
+            return False, f"invalid regex: {exc}"
+        return (True, "regex ok") if matched else (False, "regex did not match")
+    if checker_type == "contains":
+        value = checker.get("value")
+        if not isinstance(value, str):
+            return False, "contains checker requires string value"
+        case_insensitive = checker.get("case_insensitive") is True
+        hay = text.lower() if case_insensitive else text
+        needle = value.lower() if case_insensitive else value
+        return (True, "contains ok") if needle in hay else (False, "missing substring")
+    if checker_type == "contains_all":
+        values = checker.get("values")
+        if not isinstance(values, list) or not all(isinstance(v, str) for v in values):
+            return False, "contains_all checker requires string values[]"
+        case_insensitive = checker.get("case_insensitive") is True
+        hay = text.lower() if case_insensitive else text
+        for item in values:
+            needle = item.lower() if case_insensitive else item
+            if needle not in hay:
+                return False, f"missing {needle}"
+        return True, "contains_all ok"
+    return False, "unknown checker type"
+
+
+@app.post("/v1/benchmark/task")
+def runtime_task_benchmark(body: Any = Body(...)) -> dict[str, Any]:
+    if not isinstance(body, dict):
+        raise HTTPException(status_code=400, detail="Expected JSON object body.")
+    model = body.get("model")
+    tasks = body.get("tasks")
+    temperature = body.get("temperature", 0.2)
+    max_tokens = body.get("max_tokens", 1024)
+
+    if not isinstance(model, str) or not model.strip():
+        raise HTTPException(status_code=400, detail="model must be a non-empty string.")
+    if not isinstance(tasks, list) or not tasks:
+        raise HTTPException(status_code=400, detail="tasks must be a non-empty array.")
+    if not isinstance(temperature, (float, int)):
+        raise HTTPException(status_code=400, detail="temperature must be numeric.")
+    if not isinstance(max_tokens, int) or max_tokens < 1:
+        raise HTTPException(status_code=400, detail="max_tokens must be a positive integer.")
+
+    by_category: dict[str, dict[str, int]] = {}
+    results: list[dict[str, Any]] = []
+    started = time.perf_counter()
+
+    for task in tasks:
+        if not isinstance(task, dict):
+            raise HTTPException(status_code=400, detail="each task must be an object.")
+        task_id = task.get("id")
+        category = task.get("category")
+        prompt = task.get("prompt")
+        checker = task.get("checker")
+        system = task.get("system")
+        if not isinstance(task_id, str) or not isinstance(category, str) or not isinstance(prompt, str):
+            raise HTTPException(status_code=400, detail="task requires string id/category/prompt.")
+        if not isinstance(checker, dict):
+            raise HTTPException(status_code=400, detail="task.checker must be an object.")
+        if system is not None and not isinstance(system, str):
+            raise HTTPException(status_code=400, detail="task.system must be a string when provided.")
+
+        messages: list[dict[str, str]] = []
+        if isinstance(system, str) and system.strip():
+            messages.append({"role": "system", "content": system.strip()})
+        messages.append({"role": "user", "content": prompt.strip()})
+
+        task_started = time.perf_counter()
+        try:
+            _, payload = _runtime_json_request(
+                "POST",
+                _runtime_base_url() + "/v1/chat/completions",
+                _runtime_request_timeout_sec(),
+                body={
+                    "model": model,
+                    "messages": messages,
+                    "temperature": float(temperature),
+                    "max_tokens": max_tokens,
+                    "separate_reasoning": False,
+                    "chat_template_kwargs": {"enable_thinking": False},
+                },
+            )
+            output = _assistant_from_completion_body(payload) or ""
+            ok, reason = _run_task_checker(output, checker)
+        except HTTPException as exc:
+            ok = False
+            reason = str(exc.detail)
+
+        latency_ms = int((time.perf_counter() - task_started) * 1000)
+        bucket = by_category.setdefault(category, {"pass": 0, "fail": 0})
+        if ok:
+            bucket["pass"] += 1
+        else:
+            bucket["fail"] += 1
+        results.append(
+            {
+                "id": task_id,
+                "category": category,
+                "ok": ok,
+                "reason": reason,
+                "latencyMs": latency_ms,
+            },
+        )
+
+    passed = sum(1 for r in results if r["ok"])
+    total = len(results)
+    return {
+        "model": model,
+        "cases": total,
+        "passed": passed,
+        "failed": total - passed,
+        "passRate": round((passed / total), 4) if total else 0,
+        "wallTimeMs": int((time.perf_counter() - started) * 1000),
+        "byCategory": by_category,
+        "results": results,
+    }
 
 
 def _launch_log_path() -> Path:
@@ -285,6 +674,61 @@ def _read_file_tail(path: Path, max_bytes: int) -> str:
     return raw.decode("utf-8", errors="replace")
 
 
+def _shell_quote_path_allow_home(path: str) -> str:
+    if path == "~":
+        return "$HOME"
+    if path.startswith("~/"):
+        return "$HOME/" + shlex.quote(path[2:])
+    return shlex.quote(path)
+
+
+_CLUSTER_HOST_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+
+
+def _validate_cluster_host(host: str) -> str:
+    clean = host.strip()
+    if not clean:
+        raise HTTPException(status_code=400, detail="host is required.")
+    if not _CLUSTER_HOST_RE.fullmatch(clean):
+        raise HTTPException(status_code=400, detail="host contains invalid characters.")
+    return clean
+
+
+def _read_remote_cluster_log_tail(host: str, node_rank: int, tail_bytes: int, log_dir: str) -> dict[str, Any]:
+    safe_host = _validate_cluster_host(host)
+    if node_rank < 0:
+        raise HTTPException(status_code=400, detail="node_rank must be >= 0.")
+    log_dir_clean = (log_dir or "").strip() or "~/runtime-sglang/logs"
+    remote_path = f"{log_dir_clean.rstrip('/')}/sglang_node{node_rank}.log"
+    quoted_path = _shell_quote_path_allow_home(remote_path)
+    tail_cmd = f"if [ -f {quoted_path} ]; then tail -c {tail_bytes} {quoted_path}; fi"
+    r = subprocess.run(
+        ["ssh", safe_host, f"bash -lc {shlex.quote(tail_cmd)}"],
+        capture_output=True,
+        text=True,
+        timeout=15,
+    )
+    if r.returncode != 0:
+        stderr = (r.stderr or "").strip()
+        return {
+            "host": safe_host,
+            "node_rank": node_rank,
+            "path": remote_path,
+            "exists": False,
+            "tail_bytes": tail_bytes,
+            "content": "",
+            "error": stderr or f"ssh exited with code {r.returncode}",
+        }
+    return {
+        "host": safe_host,
+        "node_rank": node_rank,
+        "path": remote_path,
+        "exists": True,
+        "tail_bytes": tail_bytes,
+        "content": r.stdout or "",
+    }
+
+
 def _launch_log_fingerprint(path: Path) -> tuple[int, int] | None:
     """Change when the file is created, removed, truncated, or appended to (no extra deps; works on NFS)."""
     if not path.is_file():
@@ -358,6 +802,68 @@ async def api_launch_log_stream(
                         "content": _read_file_tail(path, tail_bytes),
                     },
                 )
+                since_ping = 0.0
+                yield f"data: {last_printed}\n\n"
+            elif since_ping >= LAUNCH_LOG_STREAM_PING_SEC:
+                since_ping = 0.0
+                yield ": ping\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
+@app.get("/api/cluster-log")
+def api_cluster_log(
+    host: str = Query(..., description="Cluster host, e.g. spark1"),
+    node_rank: int = Query(0, ge=0),
+    tail_bytes: int = Query(
+        131_072,
+        ge=1,
+        le=2_000_000,
+        description="Return at most this many bytes from the end of remote node log",
+    ),
+    log_dir: str = Query(
+        "~/runtime-sglang/logs",
+        description="Remote directory containing sglang_node{rank}.log",
+    ),
+) -> dict[str, Any]:
+    return _read_remote_cluster_log_tail(host, node_rank, tail_bytes, log_dir)
+
+
+@app.get("/api/cluster-log/stream")
+async def api_cluster_log_stream(
+    host: str = Query(..., description="Cluster host, e.g. spark1"),
+    node_rank: int = Query(0, ge=0),
+    tail_bytes: int = Query(
+        131_072,
+        ge=1,
+        le=2_000_000,
+        description="Return at most this many bytes from the end of remote node log on each event",
+    ),
+    log_dir: str = Query(
+        "~/runtime-sglang/logs",
+        description="Remote directory containing sglang_node{rank}.log",
+    ),
+) -> StreamingResponse:
+    safe_host = _validate_cluster_host(host)
+
+    async def event_generator() -> AsyncIterator[str]:
+        last_printed = json.dumps(_read_remote_cluster_log_tail(safe_host, node_rank, tail_bytes, log_dir))
+        yield f"data: {last_printed}\n\n"
+        since_ping = 0.0
+        while True:
+            await asyncio.sleep(LAUNCH_LOG_STREAM_POLL_SEC)
+            since_ping += LAUNCH_LOG_STREAM_POLL_SEC
+            cur_payload = json.dumps(_read_remote_cluster_log_tail(safe_host, node_rank, tail_bytes, log_dir))
+            if cur_payload != last_printed:
+                last_printed = cur_payload
                 since_ping = 0.0
                 yield f"data: {last_printed}\n\n"
             elif since_ping >= LAUNCH_LOG_STREAM_PING_SEC:
