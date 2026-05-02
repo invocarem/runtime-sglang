@@ -18,6 +18,9 @@ The repo has two categories of content:
 - `definitions.json` — Tool definitions consumed by the Stack UI
 - `model_presets.json.example` — Template for model launch presets (copy to `model_presets.json` to use)
 - `tests/` — Unit tests for `spark_runtime` helpers (no SSH/rsync needed)
+- `utils/` — Build verification scripts for the vendor packages:
+  - `utils/check_sgl.py` — Confirms sgl_kernel and PyTorch are linked (prints versions, CUDA archs)
+  - `utils/check_torch.py` — Validates torchvision forward pass and torchaudio CUDA ops
 
 **Vendor copies (synced from upstream repos, not edited here):**
 - `sglang/` — SGLang source (editable install)
@@ -34,6 +37,18 @@ These are excluded in `.claudeignore` and should not be modified in this repo.
 - The `.sglang` venv contains editable installs of sglang, sglang-kernel, pytorch, and torchvision built for the DGX Spark GPU.
 
 ## Common Commands
+
+### Build Verification
+
+After building or updating the vendor packages, run these to confirm everything links correctly:
+
+```bash
+# Verify sgl_kernel + PyTorch
+python utils/check_sgl.py
+
+# Verify torchvision + torchaudio CUDA ops
+python utils/check_torch.py
+```
 
 ### Tests
 ```bash
