@@ -140,9 +140,20 @@ def get_preset_sglang_args(preset: dict[str, object]) -> list[str]:
         raise ValueError("preset key 'sglang_args' must be a list")
     args: list[str] = []
     for item in value:
-        if not isinstance(item, str):
-            raise ValueError("preset key 'sglang_args' must contain strings only")
-        args.append(item)
+        if isinstance(item, str):
+            args.append(item)
+            continue
+        if isinstance(item, (dict, list)):
+            # Allow structured JSON payloads for flags like
+            # --model-loader-extra-config.
+            args.append(json.dumps(item, separators=(",", ":")))
+            continue
+        if isinstance(item, (int, float, bool)):
+            args.append(str(item))
+            continue
+        raise ValueError(
+            "preset key 'sglang_args' items must be string/number/bool/object/array"
+        )
     return args
 
 

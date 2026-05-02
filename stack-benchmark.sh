@@ -1,0 +1,11 @@
+python -m sglang.bench_serving \
+  --backend sglang-oai-chat \
+  --base-url http://100.109.56.33:30000 \
+  --dataset-name random \
+  --model ~/huggingface/Qwen_Qwen3.5-397B-A17B-GPTQ-Int4 \
+  --served-model-name qwen3.5-397b \
+  --tokenizer ~/huggingface/Qwen_Qwen3.5-397B-A17B-GPTQ-Int4 \
+  --num-prompts 50 \
+  --random-input-len 512 \
+  --random-output-len 256 \
+  --extra-request-body '{"separate_reasoning": false, "chat_template_kwargs": {"enable_thinking": false}}'

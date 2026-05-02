@@ -1,14 +1,17 @@
 sglang/
 pytorch/
 vision/
-.env
+audio/
 
+.env
 model_presets.json
 deploy_sets.json
 
 *.log
 node_modules/
 .venv/
+venv/
 .nimis/
 __pycache__/
 logs/
+dist/

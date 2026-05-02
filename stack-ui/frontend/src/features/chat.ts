@@ -27,6 +27,16 @@ function escapeHtml(s: string): string {
     .replace(/"/g, "&quot;");
 }
 
+function previewResponseShape(body: unknown): string {
+  try {
+    const serialized = JSON.stringify(body);
+    if (!serialized) return "<empty>";
+    return serialized.length > 240 ? `${serialized.slice(0, 240)}...` : serialized;
+  } catch {
+    return "<unserializable>";
+  }
+}
+
 function renderMessages(): void {
   if (!messagesEl) return;
   if (history.length === 0) {
@@ -62,7 +72,9 @@ async function send(): Promise<void> {
       body: JSON.stringify({ model, messages: history }),
     });
     const answer = assistantTextFromCompletionBody(body);
-    if (answer === null) throw new Error("Unexpected chat response shape.");
+    if (answer === null) {
+      throw new Error(`Unexpected chat response shape: ${previewResponseShape(body)}`);
+    }
     history = [...history, { role: "assistant", content: answer }];
     renderMessages();
     setStatus("Done.");

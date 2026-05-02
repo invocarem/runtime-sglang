@@ -8,6 +8,8 @@ CLI utilities for deploying, launching/stopping, and benchmarking this SGLang st
 - `tools/benchmark_sglang.py`: wrapper around `python -m sglang.bench_serving`
 - `tools/task_benchmark.py`: task-based pass/fail benchmark from JSONL cases
 - `tools/benchmark.py`: backward-compatible entrypoint to `benchmark_sglang.py`
+- `tools/download.py`: download a Hugging Face repo snapshot to local disk
+- `tools/model_transfer.py`: transfer downloaded model files between hosts (RDMA/TCP/rsync)
 
 ## Prerequisites
 
@@ -148,11 +150,10 @@ python stack-cli/runtime/spark_runtime.py launch --list-presets
 Launch with preset and override selected fields:
 
 ```bash
-python stack-cli/runtime/spark_runtime.py launch \
-  --mode solo \
-  --preset qwen3.5-397b \
-  --tp 2 \
-  --port 31000
+
+python ./runtime/spark_runtime.py launch   --mode cluster   --preset qwen3.5-397b   --tp 2   --port 30000 --env-file ../.env --presets-file ../model_presets.json
+[launch] cluster node 0 on spark1
+[launch] cluster node 1 on spark2
 ```
 
 ## Environment Variables (.env)
@@ -202,6 +203,97 @@ Environment variables:
 - `TASK_BENCH_INPUT`, `TASK_BENCH_BASE_URL`, `TASK_BENCH_MODEL`
 - `TASK_BENCH_TEMPERATURE`, `TASK_BENCH_MAX_TOKENS`, `TASK_BENCH_TIMEOUT_SEC`
 - `TASK_BENCH_PRESERVE_SEPARATE_REASONING`, `TASK_BENCH_PRESERVE_THINKING`
+
+## tools/download.py
+
+Download a Hugging Face repository snapshot with `huggingface_hub.snapshot_download`.
+
+```bash
+python stack-cli/tools/download.py \
+  --model-id Qwen/Qwen3.5-32B \
+  --save-dir /data/hf
+```
+
+Notes:
+
+- `--model-id` is required (e.g. `org/model`).
+- Download path is `<save-dir>/<model-id with "/" replaced by "_">`.
+- Default `--save-dir` is `/data/hf`.
+- A disk-space heartbeat is printed every 30 seconds during long downloads.
+
+## tools/model_transfer.py
+
+Transfer model directories between machines using one of three modes:
+
+- `rdma` (default): PyTorch distributed transfer (`gloo` or `nccl`)
+- `parallel_tcp`: chunked multi-stream TCP transfer
+- `rsync`: compatibility fallback over SSH
+
+### RDMA mode (recommended)
+
+Run on both nodes (rank 0 = sender, rank 1 = receiver):
+
+```bash
+# sender (rank 0)
+python stack-cli/tools/model_transfer.py \
+  --mode rdma \
+  --src /data/hf/Qwen_Qwen3.5-32B \
+  --dest /data/hf/Qwen_Qwen3.5-32B \
+  --rank 0 \
+  --world-size 2 \
+  --master-addr 192.168.100.11 \
+  --master-port 29500
+
+# receiver (rank 1)
+python stack-cli/tools/model_transfer.py \
+  --mode rdma \
+  --src /data/hf/Qwen_Qwen3.5-32B \
+  --dest /data/hf/Qwen_Qwen3.5-32B \
+  --rank 1 \
+  --world-size 2 \
+  --master-addr 192.168.100.11 \
+  --master-port 29500
+```
+
+Useful flags:
+
+- `--all-files`: force rank 0 to send all files without destination size checks.
+- `--world-size`, `--master-addr`, `--master-port`: distributed setup.
+- `MODEL_TRANSFER_TORCH_BACKEND=gloo|nccl`: choose backend (default: `gloo`).
+
+### Parallel TCP mode
+
+```bash
+python stack-cli/tools/model_transfer.py \
+  --mode parallel_tcp \
+  --src /data/hf/Qwen_Qwen3.5-32B \
+  --dest /data/hf/Qwen_Qwen3.5-32B \
+  --local-ip 192.168.100.11 \
+  --peer-ip 192.168.100.12 \
+  --port 5555 \
+  --num-streams 16
+```
+
+### Rsync mode (fallback)
+
+```bash
+python stack-cli/tools/model_transfer.py \
+  --mode rsync \
+  --src /data/hf/Qwen_Qwen3.5-32B \
+  --dest /data/hf/Qwen_Qwen3.5-32B \
+  --dest-host spark-02 \
+  --dest-user chenchen
+```
+
+Environment variables (`model_transfer.py`):
+
+- `MODEL_TRANSFER_SRC`, `MODEL_TRANSFER_DEST`, `MODEL_TRANSFER_MODE`
+- `MODEL_TRANSFER_RANK`, `MODEL_TRANSFER_WORLD_SIZE`
+- `MODEL_TRANSFER_MASTER_ADDR`, `MODEL_TRANSFER_MASTER_PORT`
+- `MODEL_TRANSFER_LOCAL_IP`, `MODEL_TRANSFER_PEER_IP`
+- `MODEL_TRANSFER_ZMQ_PORT`, `MODEL_TRANSFER_NUM_STREAMS`
+- `MODEL_TRANSFER_DEST_HOST`, `MODEL_TRANSFER_DEST_USER`
+- `MODEL_TRANSFER_TORCH_BACKEND`, `MODEL_TRANSFER_INIT_TIMEOUT_SEC`
 
 ## Troubleshooting
 

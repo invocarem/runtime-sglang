@@ -31,6 +31,10 @@ from pydantic import BaseModel, Field
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
+# Add the runtime directory to path
+_RUNTIME_PATH = _REPO_ROOT / "stack-cli" / "runtime"
+if str(_RUNTIME_PATH) not in sys.path:
+    sys.path.insert(0, str(_RUNTIME_PATH))
 
 from spark_runtime import load_presets, run_benchmark
 
@@ -65,6 +69,7 @@ def _launch_allowed() -> bool:
 
 
 _RUNTIME_ALLOWED_HOSTS = {"localhost", "127.0.0.1", "::1"}
+_DEFAULT_CLUSTER_LOG_DIR = "~/code/build-sglang/logs"
 
 
 def _runtime_request_timeout_sec() -> int:
@@ -205,7 +210,7 @@ class LaunchRequest(BaseModel):
     env_file: str = ""
     log_file: str = "sglang_solo.log"
     dist_addr: str = "spark-01:20000"
-    log_dir: str = "~/runtime-sglang/logs"
+    log_dir: str = _DEFAULT_CLUSTER_LOG_DIR
 
 
 class StopRequest(BaseModel):
@@ -315,6 +320,23 @@ def _runtime_text_request(url: str, timeout_sec: int) -> tuple[int, str]:
 
 
 def _assistant_from_completion_body(payload: Any) -> str | None:
+    def _content_to_text(content: Any) -> str | None:
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return None
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                if item:
+                    parts.append(item)
+                continue
+            if isinstance(item, dict):
+                text = item.get("text")
+                if isinstance(text, str) and text:
+                    parts.append(text)
+        return "".join(parts) if parts else None
+
     if not isinstance(payload, dict):
         return None
     choices = payload.get("choices")
@@ -326,8 +348,12 @@ def _assistant_from_completion_body(payload: Any) -> str | None:
     message = first.get("message")
     if isinstance(message, dict):
         content = message.get("content")
-        if isinstance(content, str):
-            return content
+        text = _content_to_text(content)
+        if text is not None:
+            return text
+        reasoning = message.get("reasoning_content")
+        if isinstance(reasoning, str) and reasoning.strip():
+            return reasoning
     text = first.get("text")
     if isinstance(text, str):
         return text
@@ -918,10 +944,14 @@ def _read_remote_cluster_log_tail(host: str, node_rank: int, tail_bytes: int, lo
     safe_host = _validate_cluster_host(host)
     if node_rank < 0:
         raise HTTPException(status_code=400, detail="node_rank must be >= 0.")
-    log_dir_clean = (log_dir or "").strip() or "~/runtime-sglang/logs"
+    log_dir_clean = (log_dir or "").strip() or _DEFAULT_CLUSTER_LOG_DIR
     remote_path = f"{log_dir_clean.rstrip('/')}/sglang_node{node_rank}.log"
     quoted_path = _shell_quote_path_allow_home(remote_path)
-    tail_cmd = f"if [ -f {quoted_path} ]; then tail -c {tail_bytes} {quoted_path}; fi"
+    tail_cmd = (
+        f"if [ -f {quoted_path} ]; then "
+        f"echo __STACK_UI_FILE_EXISTS__ && tail -c {tail_bytes} {quoted_path}; "
+        "fi"
+    )
     r = subprocess.run(
         ["ssh", safe_host, f"bash -lc {shlex.quote(tail_cmd)}"],
         capture_output=True,
@@ -939,13 +969,17 @@ def _read_remote_cluster_log_tail(host: str, node_rank: int, tail_bytes: int, lo
             "content": "",
             "error": stderr or f"ssh exited with code {r.returncode}",
         }
+    marker = "__STACK_UI_FILE_EXISTS__"
+    stdout = r.stdout or ""
+    file_exists = marker in stdout
+    content = stdout.replace(f"{marker}\n", "", 1) if file_exists else ""
     return {
         "host": safe_host,
         "node_rank": node_rank,
         "path": remote_path,
-        "exists": True,
+        "exists": file_exists,
         "tail_bytes": tail_bytes,
-        "content": r.stdout or "",
+        "content": content,
     }
 
 
@@ -1050,7 +1084,7 @@ def api_cluster_log(
         description="Return at most this many bytes from the end of remote node log",
     ),
     log_dir: str = Query(
-        "~/runtime-sglang/logs",
+        _DEFAULT_CLUSTER_LOG_DIR,
         description="Remote directory containing sglang_node{rank}.log",
     ),
 ) -> dict[str, Any]:
@@ -1068,7 +1102,7 @@ async def api_cluster_log_stream(
         description="Return at most this many bytes from the end of remote node log on each event",
     ),
     log_dir: str = Query(
-        "~/runtime-sglang/logs",
+        _DEFAULT_CLUSTER_LOG_DIR,
         description="Remote directory containing sglang_node{rank}.log",
     ),
 ) -> StreamingResponse:
@@ -1278,6 +1312,7 @@ def api_launch(req: LaunchRequest) -> dict[str, Any]:
 
     cmd: list[str] = [
         sys.executable,
+        "-u",
         str(spark_py),
         "launch",
         "--preset",

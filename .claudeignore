@@ -1,0 +1,13 @@
+.nimis/
+
+sglang/
+vision/
+audio/
+pytorch/
+
+# Optional: exclude other common large directories
+node_modules/
+.git/
+__pycache__/
+*.log
+
