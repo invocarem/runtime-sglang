@@ -173,11 +173,15 @@ Precedence is generally: CLI flags > `.env` > preset values > built-in defaults.
 Wrapper for `sglang.bench_serving` with stack defaults and served-model auto-detection.
 
 ```bash
-python stack-cli/tools/benchmark_sglang.py \
+
+export HF_HOME=~/huggingface
+export TRANSFORMERS_CACHE=~/huggingface
+
+python tools/benchmark_sglang.py \
   --base-url http://127.0.0.1:30000 \
   --dataset-name random \
-  --num-prompts 128 \
-  --model qwen3.5-2b
+  --num-prompts 10 \
+  --model qwen3.6-27b
 ```
 
 Environment variables:
