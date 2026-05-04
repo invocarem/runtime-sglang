@@ -5,3 +5,5 @@ export LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 export MAX_JOBS=4
 export CMAKE_BUILD_PARALLEL_LEVEL=4
 
+export USE_NUMPY=1
+
